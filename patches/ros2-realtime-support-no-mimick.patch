@@ -1,0 +1,11 @@
+diff --git a/rclcpp_realtime/CMakeLists.txt b/rclcpp_realtime/CMakeLists.txt
+--- a/rclcpp_realtime/CMakeLists.txt
++++ b/rclcpp_realtime/CMakeLists.txt
+@@ -13,7 +13,6 @@ endif()
+ 
+ find_package(ament_cmake REQUIRED)
+ find_package(tracetools REQUIRED)
+-find_package(mimick_vendor REQUIRED)
+ find_package(rclcpp REQUIRED)
+ find_package(rcpputils_realtime REQUIRED)
+ find_package(rcl_realtime REQUIRED)

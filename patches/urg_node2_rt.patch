@@ -1,0 +1,177 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 48ff1a3078534cdd8a2cd025be53a1a742e79fe6..7d12eaba685851f9a3a8da4105aa8935812dc133 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -6,9 +6,9 @@ if(NOT CMAKE_C_STANDARD)
+   set(CMAKE_C_STANDARD 99)
+ endif()
+ 
+-# Default to C++14
++# The realtime support API requires C++17
+ if(NOT CMAKE_CXX_STANDARD)
+-  set(CMAKE_CXX_STANDARD 14)
++  set(CMAKE_CXX_STANDARD 17)
+ endif()
+ 
+ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+@@ -18,6 +18,8 @@ endif()
+ # find dependencies
+ find_package(ament_cmake REQUIRED)
+ find_package(rclcpp REQUIRED)
++find_package(rclcpp_realtime REQUIRED)
++find_package(rcpputils_realtime REQUIRED)
+ find_package(rclcpp_components REQUIRED)
+ find_package(rclcpp_lifecycle REQUIRED)
+ find_package(lifecycle_msgs REQUIRED)
+@@ -43,14 +45,16 @@ add_library(urg_c SHARED
+ )
+ 
+ add_library(urg_node2 SHARED src/urg_node2.cpp)
+-ament_target_dependencies(urg_node2 rclcpp rclcpp_components rclcpp_lifecycle lifecycle_msgs sensor_msgs diagnostic_updater laser_proc)
+-rclcpp_components_register_node(urg_node2
+-  PLUGIN "urg_node2::UrgNode2"
+-  EXECUTABLE urg_node2_node)
++ament_target_dependencies(urg_node2 rclcpp rclcpp_components rclcpp_lifecycle lifecycle_msgs sensor_msgs diagnostic_updater laser_proc rclcpp_realtime rcpputils_realtime)
++rclcpp_components_register_nodes(urg_node2 "urg_node2::UrgNode2")
++add_executable(urg_node2_node src/urg_node2_main.cpp)
++ament_target_dependencies(urg_node2_node rclcpp rclcpp_lifecycle rclcpp_realtime
++  sensor_msgs diagnostic_updater laser_proc)
++target_link_libraries(urg_node2_node urg_node2)
+ target_link_libraries(urg_node2 urg_c)
+ 
+ install(TARGETS
+-  urg_node2 urg_c
++  urg_node2 urg_c urg_node2_node
+   LIBRARY DESTINATION lib
+   RUNTIME DESTINATION lib/${PROJECT_NAME}
+ )
+@@ -62,7 +66,7 @@ install(DIRECTORY launch config
+ if(BUILD_TESTING)
+   find_package(ament_cmake_gtest)
+   ament_add_gtest(urg_node2_test src/urg_node2.cpp test/urg_node2_test.cpp TIMEOUT 200)
+-  ament_target_dependencies(urg_node2_test rclcpp rclcpp_components rclcpp_lifecycle lifecycle_msgs sensor_msgs diagnostic_updater laser_proc)
++  ament_target_dependencies(urg_node2_test rclcpp rclcpp_components rclcpp_lifecycle lifecycle_msgs sensor_msgs diagnostic_updater laser_proc rclcpp_realtime rcpputils_realtime)
+   target_link_libraries(urg_node2_test urg_c)
+ endif()
+ 
+diff --git a/include/urg_node2/urg_node2.hpp b/include/urg_node2/urg_node2.hpp
+index e215889837eba7bd28036c726ac86162be5eb63b..ee91b51eb87bead9755349020ff014524fd4d281 100644
+--- a/include/urg_node2/urg_node2.hpp
++++ b/include/urg_node2/urg_node2.hpp
+@@ -28,7 +28,7 @@
+ #include <algorithm>
+ #include <stdexcept>
+ #include <memory>
+-#include <thread>
++#include "rcpputils_realtime/thread.hpp"
+ #include <functional>
+ #include <limits>
+ #include <csignal>
+@@ -284,7 +284,7 @@ private:
+   /** スレッドの終了フラグ */
+   bool close_thread_;
+   /** スキャンスレッドのスレッド変数 */
+-  std::thread scan_thread_;
++  rcpputils::Thread scan_thread_;
+ 
+   /** LiDAR管理構造体 */
+   urg_t urg_;
+diff --git a/package.xml b/package.xml
+index a0e103c0479ecfadb52f0defe6ca390b00766156..e106b895e02a214cac5bd858f7e807e606cb457b 100644
+--- a/package.xml
++++ b/package.xml
+@@ -13,6 +13,8 @@
+   <buildtool_depend>ament_cmake</buildtool_depend>
+ 
+   <depend>rclcpp</depend>
++  <depend>rclcpp_realtime</depend>
++  <depend>rcpputils_realtime</depend>
+   <depend>rclcpp_components</depend>
+   <depend>rclcpp_lifecycle</depend>
+   <depend>lifecycle_msgs</depend>
+diff --git a/src/urg_node2.cpp b/src/urg_node2.cpp
+index 36e3214703fbd3c4faeb65d0bbf5bd3e00c8cf7a..03c0706dd056c24980b447bdace68828ac54f92d 100644
+--- a/src/urg_node2.cpp
++++ b/src/urg_node2.cpp
+@@ -13,6 +13,11 @@
+ // limitations under the License.
+ 
+ #include "urg_node2/urg_node2.hpp"
++#include <cstring>
++#include <optional>
++#include "rcpputils/scope_exit.hpp"
++#include "rcl_realtime/context.h"
++#include "rclcpp_realtime/contexts/realtime_argument.hpp"
+ 
+ namespace urg_node2
+ {
+@@ -701,7 +706,31 @@ void UrgNode2::start_thread(void)
+ {
+   // スレッド終了フラグのクリア
+   close_thread_ = false;
+-  scan_thread_ = std::thread(std::bind(&UrgNode2::scan_thread, this));
++  // Use the same realtime context as the executor, with a separate scan tag.
++  rclcpp_realtime::contexts::RealtimeArguments realtime_arguments;
++  const auto context = get_node_base_interface()->get_context()->get_rcl_context();
++  const auto context_id = rcl_context_get_instance_id(context.get());
++  std::optional<rcpputils::ThreadAttribute> thread_attribute;
++  rcutils_thread_attrs_t attributes{};
++  if (realtime_arguments.get_thread_attrs(context_id, &attributes)) {
++    RCPPUTILS_SCOPE_EXIT(
++      const auto cleanup_result = rcutils_thread_attrs_fini(&attributes);
++      (void)cleanup_result;
++    );
++    for (size_t i = 0; i < attributes.num_attributes; ++i) {
++      const auto & attribute = attributes.attributes[i];
++      if (attribute.tag && std::strcmp(attribute.tag, "URG_SCAN_THREAD") == 0) {
++        thread_attribute.emplace(attribute);
++        break;
++      }
++    }
++  }
++  if (thread_attribute) {
++    scan_thread_ = rcpputils::Thread(*thread_attribute, &UrgNode2::scan_thread, this);
++    RCLCPP_INFO(get_logger(), "Applied realtime attributes: URG_SCAN_THREAD");
++  } else {
++    scan_thread_ = rcpputils::Thread(&UrgNode2::scan_thread, this);
++  }
+ }
+ 
+ // スキャンスレッドの停止
+diff --git a/src/urg_node2_main.cpp b/src/urg_node2_main.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b8a2ca97088ac748194a94c7b3279f93d30e686
+--- /dev/null
++++ b/src/urg_node2_main.cpp
+@@ -0,0 +1,31 @@
++// Copyright 2026
++// SPDX-License-Identifier: Apache-2.0
++
++#include <exception>
++#include <iostream>
++#include <memory>
++
++#include "urg_node2/urg_node2.hpp"
++#include "rclcpp_realtime/rclcpp_realtime.hpp"
++
++int main(int argc, char ** argv)
++{
++  int status = 0;
++  bool initialized = false;
++  try {
++    rclcpp_realtime::init(argc, argv);
++    initialized = true;
++    auto node = std::make_shared<urg_node2::UrgNode2>(rclcpp::NodeOptions{});
++    rclcpp_realtime::SchedParamExecutorOptions options;
++    rclcpp_realtime::executors::SchedParamSingleThreadedExecutor executor(options);
++    executor.add_node(node->get_node_base_interface());
++    executor.spin();
++  } catch (const std::exception & error) {
++    std::cerr << "urg_node2: " << error.what() << std::endl;
++    status = 1;
++  }
++  if (initialized) {
++    rclcpp_realtime::shutdown();
++  }
++  return status;
++}
